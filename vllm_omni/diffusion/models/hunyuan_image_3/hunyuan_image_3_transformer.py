@@ -8,9 +8,12 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, cast
 
+import os
 import numpy as np
 import regex as re
 import torch
+import torch.nn.functional as F
+import torch.distributed as dist
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
@@ -31,6 +34,7 @@ from transformers.modeling_utils import PreTrainedModel
 from vllm.config import CacheConfig
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -55,6 +59,8 @@ from vllm.model_executor.models.utils import (
     make_layers,
 )
 from vllm.v1.attention.backend import AttentionType
+from vllm.forward_context import get_forward_context
+from vllm_ascend.ascend_forward_context import MoECommType
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
@@ -75,6 +81,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.hunyuan_image_3.hunyuan_fused_moe import HunyuanFusedMoE
+from vllm_omni.diffusion.models.hunyuan_image_3.hunyuan_row_parallel_linear import HunyuanRowParallelLinear
 
 logger = logging.getLogger(__name__)
 
@@ -1522,6 +1529,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             num_redundant_experts=self.n_redundant_experts,
             pcp_size=1,
         )
+        self.hunyuan_enable_flash_comm1 = bool(int(os.getenv("HY_IMAGE_3_ENABLE_FLASHCOMM1", 0)))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
@@ -1536,7 +1544,28 @@ class HunYuanSparseMoeBlock(nn.Module):
             final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
 
         if self.tp_size > 1:
-            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(final_hidden_states)
+            # If enable FC1, moe_comm_type: ALLGATHER needs to do reduce_scatter
+            if self.hunyuan_enable_flash_comm1:
+                moe_comm_type = getattr(get_forward_context(), "moe_comm_type", None)
+                if moe_comm_type == MoECommType.ALLTOALL:
+                    return final_hidden_states.view(orig_shape)
+                elif moe_comm_type == MoECommType.ALLGATHER:
+                    tp_group = get_tp_group().device_group
+
+                    ws = dist.get_world_size(tp_group)
+                    assert final_hidden_states.size(0) % ws == 0
+
+                    out_shape = (final_hidden_states.size(0) // ws, *final_hidden_states.shape[1:])
+                    out = torch.empty(out_shape, device=final_hidden_states.device, dtype=final_hidden_states.dtype)
+
+                    chunks = list(torch.chunk(final_hidden_states, ws, dim=0))
+                    dist.reduce_scatter(out, chunks, group=tp_group)
+                    final_hidden_states = out
+                    return final_hidden_states
+                else:
+                    ValueError(f"moe_comm_type must be ALLGATHER or ALLTOALL when enable FlashComm v1, but got {moe_comm_type}")
+            else:
+                final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
 
@@ -1601,7 +1630,7 @@ class HunYuanAttention(nn.Module):
             prefix=f"{prefix}.qkv_proj",
         )
 
-        self.o_proj = RowParallelLinear(
+        self.o_proj = HunyuanRowParallelLinear(
             input_size=self.total_num_heads * self.head_dim,
             output_size=hidden_size,
             bias=bias,
@@ -1649,6 +1678,8 @@ class HunYuanAttention(nn.Module):
             self.query_layernorm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
             self.key_layernorm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
+        self.hunyuan_enable_flash_comm1 = bool(int(os.getenv("HY_IMAGE_3_ENABLE_FLASHCOMM1", 0)))
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1658,8 +1689,24 @@ class HunYuanAttention(nn.Module):
         custom_pos_emb: tuple[torch.FloatTensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        bsz, q_len, _ = hidden_states.size()
-        qkv, _ = self.qkv_proj(hidden_states)
+        bsz = len(kwargs.get("query_lens"))
+        q_len = kwargs.get("query_lens")[0]
+        if self.hunyuan_enable_flash_comm1:
+            if not self.layer_id:
+                qkv, _ = self.qkv_proj(hidden_states)
+            else:
+                world_size = dist.get_world_size()
+                hidden_states_gathered = torch.zeros([world_size * hidden_states.shape[0], *hidden_states.shape[1:]],
+                                                    device=hidden_states.device, dtype=hidden_states.dtype)
+                torch.distributed.all_gather_into_tensor(hidden_states_gathered, hidden_states.contiguous())
+                hidden_states = hidden_states_gathered.contiguous()
+                pad_size = (world_size - (bsz*q_len % world_size)) % world_size
+                if pad_size:
+                    hidden_states = hidden_states[:-pad_size]
+                qkv, _ = self.qkv_proj(hidden_states)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         past_key_value: Cache | None = kwargs.get("past_key_value", None)
@@ -1686,7 +1733,8 @@ class HunYuanAttention(nn.Module):
         # For o_proj
         attn_output = attn_output.view(q.shape[0], -1)
         output, _ = self.o_proj(attn_output)
-        output = output.reshape(bsz, q_len, -1)
+        if not self.hunyuan_enable_flash_comm1:
+            output = output.reshape(bsz, q_len, -1)
         return output, None, past_key_value
 
 
@@ -1697,6 +1745,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
+        self.num_hidden_layers = config.num_hidden_layers
         self.intermediate_size = (
             config.intermediate_size
             if isinstance(config.intermediate_size, int)
@@ -1745,6 +1794,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hunyuan_enable_flash_comm1 = bool(int(os.getenv("HY_IMAGE_3_ENABLE_FLASHCOMM1", 0)))
 
     def forward(
         self,
@@ -1781,6 +1831,11 @@ class HunyuanImage3DecoderLayer(nn.Module):
                 "`attention_mask` instead.`"
             )
 
+        rank, world_size = dist.get_rank(), dist.get_world_size()
+        bs = len(kwargs.get("query_lens"))
+        q_len = kwargs.get("query_lens")[0]
+        origin_len = bs*q_len
+
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
@@ -1794,13 +1849,42 @@ class HunyuanImage3DecoderLayer(nn.Module):
             use_cache=use_cache,
             **kwargs,
         )
-        hidden_states = residual + hidden_states
+
+        if self.hunyuan_enable_flash_comm1 and not self.layer_idx:
+            full_len = hidden_states.shape[0]*world_size
+            origin_len = residual.shape[0]
+            need_pad = origin_len != full_len
+            pad_size = (world_size - (bs*q_len % world_size)) % world_size
+            if need_pad:
+                residual = F.pad(residual, (0, 0, 0, pad_size))
+            residual_chunk = torch.chunk(residual, world_size, dim=0)[rank]
+            hs = hidden_states[:residual_chunk.shape[0]]
+            hidden_states = residual_chunk + hs
+        else:
+            hidden_states = residual + hidden_states
+
         # Fully Connected
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+
+        hidden_states_ = self.post_attention_layernorm(hidden_states)
+
+        if self.hunyuan_enable_flash_comm1 and getattr(get_forward_context(), "moe_comm_type", None) == MoECommType.ALLGATHER:
+            # insert all gather here
+            hidden_states = torch.zeros([world_size * hidden_states.shape[0], *hidden_states.shape[1:]], device=hidden_states.device, dtype=hidden_states.dtype)
+            torch.distributed.all_gather_into_tensor(hidden_states, hidden_states_)
+            # Fully Connected
+            hidden_states = self.mlp(hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states_)
 
         hidden_states = residual + hidden_states
+
+        if self.hunyuan_enable_flash_comm1:
+            if self.layer_idx == self.num_hidden_layers - 1:
+                hidden_states_ = torch.zeros([world_size * hidden_states.shape[0], *hidden_states.shape[1:]], device=hidden_states.device, dtype=residual.dtype)
+                torch.distributed.all_gather_into_tensor(hidden_states_, hidden_states)
+                hidden_states = hidden_states_.contiguous()
+            hidden_states = hidden_states[:origin_len,:]
 
         outputs = (hidden_states,)
 
@@ -1942,6 +2026,7 @@ class HunyuanImage3Model(nn.Module):
         self.pre_processor = HunyuanImagePreprocessor()
         self.unifiled_cat = UnifiledCat()
         self.post_processor = HunyuanImagePostprocessor()
+        self.hunyuan_enable_flash_comm1 = bool(int(os.getenv("HY_IMAGE_3_ENABLE_FLASHCOMM1", 0)))
 
     def _split_qkv_weight(self, qkv: torch.Tensor):
         num_attention_heads = self.config.num_attention_heads
@@ -2036,7 +2121,7 @@ class HunyuanImage3Model(nn.Module):
         for name, loaded_weight in weights:
             # print(f"Loading weight name: {name}, tp_rank: {tp_rank}", flush=True)
             if contains_unexpected_keyword(name, unexpected_keywords):
-                logger.warning("Skipping unexpected weight name: %s", name)
+                print(f"Skipping unexpected weight name: {name}")
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -2301,6 +2386,9 @@ class HunyuanImage3Model(nn.Module):
                 k_pad = attention_mask.new_zeros(B, H, Q + pad, pad)
                 attention_mask = torch.cat((attention_mask, k_pad), dim=3)
 
+        if self.hunyuan_enable_flash_comm1:
+            hidden_states = hidden_states.reshape(len(query_lens)*query_lens[0], -1)
+
         for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -2331,6 +2419,9 @@ class HunyuanImage3Model(nn.Module):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
+
+        if self.hunyuan_enable_flash_comm1:
+            hidden_states = hidden_states.reshape(len(query_lens), query_lens[0], -1)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -2679,8 +2770,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         self._guidance_scale = guidance_scale
         self._guidance_rescale = guidance_rescale
 
-        # Detect CFG parallel configuration (only 2-branch layout is supported)
-        cfg_parallel_ready = self.do_classifier_free_guidance and get_classifier_free_guidance_world_size() == 2
+        cfg_factor = 1 + self.do_classifier_free_guidance
 
         # Define call parameters
         device = self._execution_device
@@ -2708,9 +2798,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         # Prepare extra step kwargs.
         _scheduler_step_extra_kwargs = self.prepare_extra_func_kwargs(self.scheduler.step, {"generator": generator})
 
-        # Prepare model kwargs — attention mask is built from the full
-        # (cfg_factor=2) batch before any splitting so that each rank's
-        # slice is correct.
+        # Prepare model kwargs
         input_ids = model_kwargs.pop("input_ids")
         attention_mask = self.model._prepare_attention_mask_for_generation(  # noqa
             input_ids,
@@ -2757,64 +2845,33 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                if cfg_parallel_ready:
-                    # CFG parallel: each rank forwards its own branch (no batch doubling)
-                    latent_model_input = latents
-                else:
-                    # Sequential CFG: double the batch
-                    latent_model_input = torch.cat([latents] * cfg_factor)
+                # expand the latents if we are doing classifier free guidance
+                latent_model_input = torch.cat([latents] * cfg_factor)
+                # latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 t_expand = t.repeat(latent_model_input.shape[0])
 
-                # ---- TeaCache: decide whether to compute or reuse ----
-                should_compute = True
-                if tea_cache_config is not None:
-                    with torch.no_grad():
-                        # Use timestep embedding as the modulated input for cache decision
-                        cur_mod = self.model.time_embed(t.unsqueeze(0))
-                    if tc_cnt > 0 and tc_prev_mod is not None:
-                        rel_dist = (
-                            ((cur_mod - tc_prev_mod).abs().mean() / (tc_prev_mod.abs().mean() + 1e-8)).cpu().item()
-                        )
-                        rescaled = float(tc_rescale(rel_dist))
-                        tc_acc_dist += abs(rescaled)
-                        if tc_acc_dist < tea_cache_config.rel_l1_thresh:
-                            should_compute = False
-                        else:
-                            tc_acc_dist = 0.0
-                    tc_prev_mod = cur_mod.detach()
+                model_inputs = self.model.prepare_inputs_for_generation(
+                    input_ids,
+                    images=latent_model_input,
+                    timestep=t_expand,
+                    **model_kwargs,
+                )
 
-                if should_compute:
-                    model_inputs = self.model.prepare_inputs_for_generation(
-                        input_ids,
-                        images=latent_model_input,
-                        timestep=t_expand,
-                        **model_kwargs,
-                    )
+                with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
+                    model_output = self.model.forward_call(**model_inputs, first_step=(i == 0))
+                    pred = model_output["diffusion_prediction"]
+                pred = pred.to(dtype=torch.float32)
 
-                    with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
-                        model_output = self.model.forward_call(**model_inputs, first_step=(i == 0))
-                        pred = model_output["diffusion_prediction"]
-                    pred = pred.to(dtype=torch.float32)
-
-                    if tea_cache_config is not None:
-                        tc_prev_pred = pred.clone()
-                else:
-                    # TeaCache fast path: reuse previous prediction
-                    pred = tc_prev_pred
-
-                # Perform guidance
-                if cfg_parallel_ready:
-                    # CFG parallel: all_gather → all ranks combine locally (no broadcast needed)
-                    gathered = cfg_group.all_gather(pred, separate_tensors=True)
-                    pred = self.cfg_operator(gathered[0], gathered[1], self.guidance_scale, step=i)
-                elif self.do_classifier_free_guidance:
+                # perform guidance
+                if self.do_classifier_free_guidance:
                     pred_cond, pred_uncond = pred.chunk(2)
                     pred = self.cfg_operator(pred_cond, pred_uncond, self.guidance_scale, step=i)
 
-                # Scheduler step (all ranks compute locally in CFG parallel)
+                # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(pred, t, latents, **_scheduler_step_extra_kwargs, return_dict=False)[0]
-                if i != len(timesteps) - 1 and should_compute:
+
+                if i != len(timesteps) - 1:
                     model_kwargs = self.model._update_model_kwargs_for_generation(  # noqa
                         model_output,
                         model_kwargs,

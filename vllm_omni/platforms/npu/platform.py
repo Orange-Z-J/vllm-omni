@@ -39,19 +39,27 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     @classmethod
     def get_diffusion_model_impl_qualname(cls, op_name: str) -> str:
         if op_name == "hunyuan_fused_moe":
-            return "vllm_omni.platforms.npu.models.hunyuan_fused_moe.AscendHunyuanFusedMoE"
+            return "vllm_omni.platforms.npu.models.hunyuan_fused_moe.AscendHunyuanSharedFusedMoE"
+        if op_name == "hunyuan_row_parallel_linear":
+            return "vllm_omni.platforms.npu.models.hunyuan_row_parallel_linear.AscendHunyuanRowParallelLinear"
         return super().get_diffusion_model_impl_qualname(op_name)
 
     @classmethod
     def prepare_diffusion_op_runtime(cls, op_name: str, **kwargs: Any) -> None:
-        if op_name != "hunyuan_fused_moe":
+        if op_name == "hunyuan_fused_moe":
+            from vllm_omni.platforms.npu.models.hunyuan_fused_moe import (
+                prepare_hunyuan_fused_moe_runtime,
+            )
+            prepare_hunyuan_fused_moe_runtime()
+
+        elif op_name == "hunyuan_row_parallel_linear":
+            from vllm_omni.platforms.npu.models.hunyuan_row_parallel_linear import (
+                prepare_hunyuan_row_parallel_linear_runtime,
+            )
+
+            prepare_hunyuan_row_parallel_linear_runtime()
+        else:
             return
-
-        from vllm_omni.platforms.npu.models.hunyuan_fused_moe import (
-            prepare_hunyuan_fused_moe_runtime,
-        )
-
-        prepare_hunyuan_fused_moe_runtime()
 
     @classmethod
     def get_diffusion_attn_backend_cls(
