@@ -60,7 +60,6 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.v1.attention.backend import AttentionType
 from vllm.forward_context import get_forward_context
-from vllm_ascend.ascend_forward_context import MoECommType
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
