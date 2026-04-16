@@ -99,6 +99,9 @@ def _is_moe(config: PretrainedConfig) -> bool:
     return False
 
 
+def _is_enable_flash_comm_v1() -> bool:
+    return bool(int(os.getenv("HY_IMAGE_3_ENABLE_FLASHCOMM1", 0)))
+
 def _get_cla_factor(config: PretrainedConfig) -> int:
     if not getattr(config, "use_cla", False):
         return 1
@@ -1529,7 +1532,6 @@ class HunYuanSparseMoeBlock(nn.Module):
             num_redundant_experts=self.n_redundant_experts,
             pcp_size=1,
         )
-        self.hunyuan_enable_flash_comm1 = bool(int(os.getenv("HY_IMAGE_3_ENABLE_FLASHCOMM1", 0)))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
@@ -1545,11 +1547,11 @@ class HunYuanSparseMoeBlock(nn.Module):
 
         if self.tp_size > 1:
             # If enable FC1, moe_comm_type: ALLGATHER needs to do reduce_scatter
-            if self.hunyuan_enable_flash_comm1:
-                moe_comm_type = getattr(get_forward_context(), "moe_comm_type", None)
-                if moe_comm_type == MoECommType.ALLTOALL:
+            if _is_enable_flash_comm_v1():
+                moe_comm_type = getattr(get_forward_context(), "moe_comm_type_name", None)
+                if moe_comm_type == "ALLTOALL":
                     return final_hidden_states.view(orig_shape)
-                elif moe_comm_type == MoECommType.ALLGATHER:
+                elif moe_comm_type == "ALLGATHER":
                     tp_group = get_tp_group().device_group
 
                     ws = dist.get_world_size(tp_group)
@@ -1678,8 +1680,6 @@ class HunYuanAttention(nn.Module):
             self.query_layernorm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
             self.key_layernorm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        self.hunyuan_enable_flash_comm1 = bool(int(os.getenv("HY_IMAGE_3_ENABLE_FLASHCOMM1", 0)))
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -1691,7 +1691,7 @@ class HunYuanAttention(nn.Module):
     ) -> torch.Tensor:
         bsz = len(kwargs.get("query_lens"))
         q_len = kwargs.get("query_lens")[0]
-        if self.hunyuan_enable_flash_comm1:
+        if _is_enable_flash_comm_v1():
             if not self.layer_id:
                 qkv, _ = self.qkv_proj(hidden_states)
             else:
@@ -1733,7 +1733,7 @@ class HunYuanAttention(nn.Module):
         # For o_proj
         attn_output = attn_output.view(q.shape[0], -1)
         output, _ = self.o_proj(attn_output)
-        if not self.hunyuan_enable_flash_comm1:
+        if not _is_enable_flash_comm_v1():
             output = output.reshape(bsz, q_len, -1)
         return output, None, past_key_value
 
@@ -1794,7 +1794,6 @@ class HunyuanImage3DecoderLayer(nn.Module):
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.hunyuan_enable_flash_comm1 = bool(int(os.getenv("HY_IMAGE_3_ENABLE_FLASHCOMM1", 0)))
 
     def forward(
         self,
@@ -1850,7 +1849,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
             **kwargs,
         )
 
-        if self.hunyuan_enable_flash_comm1 and not self.layer_idx:
+        if _is_enable_flash_comm_v1() and not self.layer_idx:
             full_len = hidden_states.shape[0]*world_size
             origin_len = residual.shape[0]
             need_pad = origin_len != full_len
@@ -1868,7 +1867,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
 
         hidden_states_ = self.post_attention_layernorm(hidden_states)
 
-        if self.hunyuan_enable_flash_comm1 and getattr(get_forward_context(), "moe_comm_type", None) == MoECommType.ALLGATHER:
+        if _is_enable_flash_comm_v1() and getattr(get_forward_context(), "moe_comm_type_name", None) == "ALLGATHER":
             # insert all gather here
             hidden_states = torch.zeros([world_size * hidden_states.shape[0], *hidden_states.shape[1:]], device=hidden_states.device, dtype=hidden_states.dtype)
             torch.distributed.all_gather_into_tensor(hidden_states, hidden_states_)
@@ -1878,8 +1877,8 @@ class HunyuanImage3DecoderLayer(nn.Module):
             hidden_states = self.mlp(hidden_states_)
 
         hidden_states = residual + hidden_states
-
-        if self.hunyuan_enable_flash_comm1:
+        
+        if _is_enable_flash_comm_v1():
             if self.layer_idx == self.num_hidden_layers - 1:
                 hidden_states_ = torch.zeros([world_size * hidden_states.shape[0], *hidden_states.shape[1:]], device=hidden_states.device, dtype=residual.dtype)
                 torch.distributed.all_gather_into_tensor(hidden_states_, hidden_states)
@@ -2026,7 +2025,6 @@ class HunyuanImage3Model(nn.Module):
         self.pre_processor = HunyuanImagePreprocessor()
         self.unifiled_cat = UnifiledCat()
         self.post_processor = HunyuanImagePostprocessor()
-        self.hunyuan_enable_flash_comm1 = bool(int(os.getenv("HY_IMAGE_3_ENABLE_FLASHCOMM1", 0)))
 
     def _split_qkv_weight(self, qkv: torch.Tensor):
         num_attention_heads = self.config.num_attention_heads
@@ -2386,7 +2384,7 @@ class HunyuanImage3Model(nn.Module):
                 k_pad = attention_mask.new_zeros(B, H, Q + pad, pad)
                 attention_mask = torch.cat((attention_mask, k_pad), dim=3)
 
-        if self.hunyuan_enable_flash_comm1:
+        if _is_enable_flash_comm_v1():
             hidden_states = hidden_states.reshape(len(query_lens)*query_lens[0], -1)
 
         for layer_idx, decoder_layer in enumerate(self.layers):
@@ -2420,7 +2418,7 @@ class HunyuanImage3Model(nn.Module):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
-        if self.hunyuan_enable_flash_comm1:
+        if _is_enable_flash_comm_v1():
             hidden_states = hidden_states.reshape(len(query_lens), query_lens[0], -1)
 
         # add hidden states from the last decoder layer
